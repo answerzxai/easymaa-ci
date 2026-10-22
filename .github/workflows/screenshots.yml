@@ -1,0 +1,103 @@
+name: EasyMAA screenshots
+# Builds answerzx/EasyMAA (private) on the hosted Xcode 27 image and captures
+# the run panel on iPhone (simulator) and Mac, light and dark. Results are
+# pushed to the `shots` branch of this repo under shots/<short sha>/.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: EasyMAA ref (branch, tag or sha)
+        default: main
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: screenshots
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  shots:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Checkout EasyMAA
+        uses: actions/checkout@v4
+        with:
+          repository: answerzx/EasyMAA
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.5'
+          cache: false
+      - name: Toolchain
+        run: |
+          sw_vers
+          app=$(ls -d /Applications/Xcode_27*.app | grep -v beta | sort | head -1)
+          sudo xcode-select -s "$app"
+          xcodebuild -version
+          echo "SHA=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+      - name: Mac app
+        working-directory: src
+        run: |
+          set -o pipefail
+          export EASYMAA_CODESIGN_IDENTITY=-
+          zsh scripts/package.sh 2>&1 | tail -40
+      - name: Mac screenshots
+        working-directory: src
+        run: |
+          for mode in light dark; do
+            ./.build/EasyMAA.app/Contents/MacOS/EasyMAAApp --preview --scenario=roguelike --appearance=$mode &
+            pid=$!
+            sleep 12
+            osascript -e 'tell application "System Events" to set frontmost of (first process whose unix id is '"$pid"') to true' || true
+            sleep 2
+            screencapture -x "$GITHUB_WORKSPACE/out/mac-$mode.png"
+            kill $pid; wait $pid 2>/dev/null || true
+            sleep 2
+          done
+      - name: iOS app (simulator)
+        working-directory: src
+        run: |
+          set -o pipefail
+          zsh scripts/build_ios.sh simulator 2>&1 | grep -E "error:|warning: |BUILD (SUCCEEDED|FAILED)" | tail -60
+          test -d .build/ios/Build/Products/Debug-iphonesimulator/EasyMAAMobile.app
+      - name: iOS screenshots
+        working-directory: src
+        run: |
+          set -euo pipefail
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)["devices"]
+          c=[x for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone 17 Pro") or x["name"].startswith("iPhone 17")]
+          c=c or [x for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")]
+          print(c[0]["udid"])')
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 || true
+          app=.build/ios/Build/Products/Debug-iphonesimulator/EasyMAAMobile.app
+          bundle=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")
+          xcrun simctl install "$udid" "$app"
+          for mode in light dark; do
+            xcrun simctl ui "$udid" appearance $mode
+            SIMCTL_CHILD_EASYMAA_UI_FIXTURE=running SIMCTL_CHILD_EASYMAA_UI_APPEARANCE=$mode \
+              xcrun simctl launch --terminate-running-process "$udid" "$bundle"
+            sleep 8
+            xcrun simctl io "$udid" screenshot "$GITHUB_WORKSPACE/out/ios-$mode.png"
+          done
+      - name: Publish to shots branch
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ls -la out
+          git init -q pub && cd pub
+          git config user.name "screenshots-bot"; git config user.email "actions@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch -q origin shots && git checkout -q -b shots FETCH_HEAD || git checkout -q --orphan shots
+          mkdir -p "shots/$SHA" && cp ../out/*.png "shots/$SHA/" 2>/dev/null || true
+          echo "$SHA ${{ job.status }} $(date -u +%FT%TZ)" > latest.txt
+          git add -A && git commit -qm "shots $SHA" && git push -q origin shots
