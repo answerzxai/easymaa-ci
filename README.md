@@ -1,0 +1,1 @@
+# easymaa-ci
